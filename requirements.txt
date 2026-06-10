@@ -1,0 +1,6 @@
+pipecat-ai[webrtc,openai,deepgram,sarvam,silero,runner]>=1.3.0
+ringglabs
+python-dotenv
+reportlab
+aiohttp
+pytest
