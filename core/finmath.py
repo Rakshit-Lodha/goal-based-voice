@@ -23,6 +23,36 @@ ALLOCATION = {
     "aggressive": (0.75, 0.20, 0.05),
 }
 
+# Horizon buckets and per-bucket phase glide paths.
+# Each phase: (fraction_of_horizon, equity, debt, gold). Allocations sum to 1.
+HORIZON_SHORT_MAX = 3   # years ≤ 3 → short
+HORIZON_MEDIUM_MAX = 7  # 4-7 → medium, > 7 → long
+
+PHASE_PLAN = {
+    "short":  [(1.00, 0.00, 0.95, 0.05)],
+    "medium": [(0.60, 0.50, 0.40, 0.10),
+               (0.40, 0.20, 0.75, 0.05)],
+    "long":   [(0.50, 0.80, 0.15, 0.05),
+               (0.30, 0.50, 0.40, 0.10),
+               (0.20, 0.20, 0.70, 0.10)],
+}
+
+# Funds that fill each sub-bucket within a phase's allocation, with intra-bucket
+# weights and a one-line rationale for narration.
+FUND_PALETTE = {
+    "equity": [
+        ("Nifty 50 Index Fund", 0.60, "Low-cost core owning India's 50 biggest companies."),
+        ("Flexi Cap Fund",      0.40, "Manager moves across caps for extra growth."),
+    ],
+    "debt": [
+        ("Short Duration Debt Fund", 0.70, "Steady low-volatility cushion."),
+        ("Liquid Fund",              0.30, "Cash-like, near-zero risk."),
+    ],
+    "gold": [
+        ("Gold ETF Fund of Fund", 1.00, "Hedge that holds up when equity wobbles."),
+    ],
+}
+
 
 def round_to_500(x: float) -> int:
     """Round to the nearest ₹500."""
@@ -51,19 +81,19 @@ def financial_ratios(monthly_income: float, monthly_expenses: float, monthly_emi
     savings_rate = surplus / monthly_income if monthly_income else 0.0
     dti = monthly_emi / monthly_income if monthly_income else 0.0
 
-    if savings_rate < 0.10:
-        savings_band = "low"
-    elif savings_rate <= 0.30:
-        savings_band = "moderate"
+    if savings_rate > 0.60:
+        savings_band = "good"
+    elif savings_rate >= 0.40:
+        savings_band = "average"
     else:
-        savings_band = "strong"
+        savings_band = "bad"
 
-    if dti < 0.20:
-        dti_band = "healthy"
-    elif dti <= 0.40:
-        dti_band = "moderate"
+    if dti < 0.10:
+        dti_band = "good"
+    elif dti <= 0.20:
+        dti_band = "average"
     else:
-        dti_band = "stretched"
+        dti_band = "bad"
 
     return {
         "surplus": round(surplus),
@@ -129,14 +159,20 @@ def affordability(required: float, idle_surplus: float) -> str:
     return "unaffordable"
 
 
-# Deterministic risk scoring. Each free-text answer scores -1 (conservative),
-# 0 (balanced), or +1 (aggressive) by keyword match; conservative keywords win
-# ties within an answer. Total across answers maps to a profile:
-#   total >= 2 -> aggressive, total <= -2 -> conservative, else balanced.
+# Deterministic risk scoring for the 2-question flow. Each free-text answer
+# scores -1 (conservative), 0 (balanced), or +1 (aggressive) by keyword match;
+# conservative keywords win ties within an answer. Threshold is ±1 because with
+# only 2 questions a single strong tilt should move the user off balanced.
+#   total >= 1 -> aggressive, total <= -1 -> conservative, else balanced.
+# Ambiguous words ("steady", "growth", "stable") are intentionally excluded —
+# they appear in both Q1 neutral phrasing and Q2 conservative/aggressive
+# phrasing and would misclassify.
 _AGGRESSIVE_KW = ("top up", "topup", "buy more", "invest more", "add more", "buy the dip",
-                  "opportunity", "double down", "lump sum", "buy")
+                  "opportunity", "double down", "lump sum",
+                  "maximize", "maximise", "max returns", "highest returns", "aggressive")
 _CONSERVATIVE_KW = ("exit", "sell", "withdraw", "redeem", "stop", "panic", "scared",
-                    "afraid", "worried", "worry", "fd", "fixed deposit", "safe", "pull out")
+                    "afraid", "worried", "worry", "fd", "fixed deposit", "safe", "pull out",
+                    "protect", "preserve", "conservative", "low risk", "low-risk")
 
 
 def score_risk_answer(answer: str) -> int:
@@ -148,11 +184,54 @@ def score_risk_answer(answer: str) -> int:
     return 0
 
 
+def horizon_bucket(years: int) -> str:
+    """Categorize a goal by years-to-target: short / medium / long."""
+    if years <= HORIZON_SHORT_MAX:
+        return "short"
+    if years <= HORIZON_MEDIUM_MAX:
+        return "medium"
+    return "long"
+
+
+def build_phases(bucket: str, horizon_years: int, monthly_sip: float) -> list[dict]:
+    """Per-goal phase plan: each phase has duration, allocation, fund-level SIPs.
+
+    Phase durations are rounded to whole years; the last phase absorbs rounding
+    so durations sum exactly to horizon_years.
+    """
+    plan = PHASE_PLAN[bucket]
+    phases = []
+    accumulated = 0
+    for i, (frac, eq, debt, gold) in enumerate(plan, start=1):
+        if i == len(plan):
+            years_in_phase = max(1, horizon_years - accumulated)
+        else:
+            years_in_phase = max(1, round(frac * horizon_years))
+            accumulated += years_in_phase
+        funds = []
+        for sub_bucket, share in (("equity", eq), ("debt", debt), ("gold", gold)):
+            if share <= 0:
+                continue
+            for name, weight, rationale in FUND_PALETTE[sub_bucket]:
+                sip = round_to_500(monthly_sip * share * weight)
+                if sip <= 0:
+                    continue
+                funds.append({"fund": name, "bucket": sub_bucket,
+                              "monthly_sip": sip, "rationale": rationale})
+        phases.append({
+            "phase": i,
+            "duration_years": years_in_phase,
+            "allocation": {"equity": eq, "debt": debt, "gold": gold},
+            "funds": funds,
+        })
+    return phases
+
+
 def risk_profile_from_answers(answers: list[str]) -> dict:
     total = sum(score_risk_answer(a) for a in answers)
-    if total >= 2:
+    if total >= 1:
         profile = "aggressive"
-    elif total <= -2:
+    elif total <= -1:
         profile = "conservative"
     else:
         profile = "balanced"

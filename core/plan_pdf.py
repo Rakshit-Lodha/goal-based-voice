@@ -56,7 +56,7 @@ def generate_pdf(state: SessionState) -> str:
     r = state.ratios or {}
     snapshot = [
         ["Monthly income", _inr(state.monthly_income)],
-        ["Monthly expenses", _inr(state.monthly_expenses)],
+        ["Monthly non-EMI expenses", _inr(state.monthly_expenses)],
         ["Monthly EMI", _inr(state.monthly_emi or 0)],
         ["Monthly surplus", _inr(r.get("surplus"))],
         ["Savings rate", f"{r.get('savings_rate', 0) * 100:.0f}% ({r.get('savings_band', '—')})"],
@@ -70,6 +70,14 @@ def generate_pdf(state: SessionState) -> str:
                                          ("LEFTPADDING", (0, 0), (-1, -1), 6)])))
     story.append(Spacer(1, 6 * mm))
 
+    if state.expense_breakdown:
+        story.append(Paragraph("Expense Breakdown (3-Month Average)", h2))
+        rows = [["Category", "Monthly average"]]
+        for key, value in state.expense_breakdown.items():
+            rows.append([key.replace("_", " ").title(), _inr(value)])
+        story.append(Table(rows, colWidths=[70 * mm, 50 * mm], style=table_style))
+        story.append(Spacer(1, 6 * mm))
+
     if state.portfolio:
         p = state.portfolio
         story.append(Paragraph("Existing Portfolio", h2))
@@ -79,9 +87,14 @@ def generate_pdf(state: SessionState) -> str:
             rows.append([name, h["type"], _inr(h["current_value"]), _inr(h["monthly_sip"]), f"{h['rating']}/5"])
         rows.append(["Total", "", _inr(p["total_value"]), _inr(p["total_monthly_sip"]), ""])
         story.append(Table(rows, colWidths=[62 * mm, 20 * mm, 30 * mm, 30 * mm, 18 * mm], style=table_style))
+        if p.get("review_methodology"):
+            story.append(Paragraph(p["review_methodology"], body))
         if p["underperformers"]:
             story.append(Paragraph(
                 f"(!) Flagged underperformers to switch out: {', '.join(p['underperformers'])}.", body))
+            for review in p.get("fund_reviews", []):
+                if review.get("status") != "good":
+                    story.append(Paragraph(f"{review['fund']}: {review['reason']}.", body))
         story.append(Spacer(1, 6 * mm))
 
     story.append(Paragraph("Your Goals", h2))
@@ -102,28 +115,50 @@ def generate_pdf(state: SessionState) -> str:
     story.append(PageBreak())
 
     # Page 2: recommendation + actions
-    story.append(Paragraph("Recommended Portfolio", h2))
-    if state.proposed_portfolio:
-        pp = state.proposed_portfolio
+    story.append(Paragraph("Recommended Portfolio (Phased by Goal)", h2))
+    if state.proposed_portfolios:
+        total_sip = sum(pp["monthly_sip"] for pp in state.proposed_portfolios.values())
         story.append(Paragraph(
-            f"Total monthly investment: <b>{_inr(pp['monthly_sip'])}</b> · "
-            f"Allocation: {pp['allocation']['equity'] * 100:.0f}% equity / "
-            f"{pp['allocation']['debt'] * 100:.0f}% debt / {pp['allocation']['gold'] * 100:.0f}% gold", body))
-        rows = [["Fund", "Bucket", "Monthly SIP", "Why"]]
-        for f in pp["funds"]:
-            rows.append([f["fund"], f["bucket"], _inr(f["monthly_sip"]), Paragraph(f["rationale"], body)])
-        story.append(Table(rows, colWidths=[45 * mm, 18 * mm, 25 * mm, 72 * mm], style=table_style))
+            f"Total monthly investment across all goals: <b>{_inr(total_sip)}</b>. "
+            f"Each goal is phased by its horizon — short-term goals run one debt-heavy phase, "
+            f"medium-term goals run two phases (balanced → debt), long-term goals run three "
+            f"phases (equity-heavy → balanced → debt glide-down).", body))
+        story.append(Spacer(1, 4 * mm))
+        for pp in state.proposed_portfolios.values():
+            story.append(Paragraph(
+                f"<b>{pp['goal']}</b> — {pp['horizon_bucket']}-term, {pp['horizon_years']} years · "
+                f"Monthly SIP {_inr(pp['monthly_sip'])}", body))
+            story.append(Paragraph(pp.get("selection_basis", ""), body))
+            current = pp.get("current_phase") or pp["phases"][0]
+            a = current["allocation"]
+            alloc = f"{a['equity'] * 100:.0f}/{a['debt'] * 100:.0f}/{a['gold'] * 100:.0f}"
+            rows = [["Current phase", "Years", "Allocation", "Fund", "Monthly SIP"]]
+            for i, f in enumerate(current["funds"]):
+                rows.append([
+                    f"P{current['phase']}" if i == 0 else "",
+                    f"{current['duration_years']}y" if i == 0 else "",
+                    alloc if i == 0 else "",
+                    f["fund"],
+                    _inr(f["monthly_sip"]),
+                ])
+            story.append(Table(rows, colWidths=[14 * mm, 14 * mm, 26 * mm, 60 * mm, 26 * mm],
+                               style=table_style))
+            if len(pp["phases"]) > 1:
+                future = ", ".join(f"P{ph['phase']} for {ph['duration_years']}y" for ph in pp["phases"][1:])
+                story.append(Paragraph(f"Future glide path: {future}.", body))
+            story.append(Spacer(1, 4 * mm))
     else:
         story.append(Paragraph("To be finalized with your advisor.", body))
-    story.append(Spacer(1, 8 * mm))
+    story.append(Spacer(1, 6 * mm))
 
     story.append(Paragraph("Action Plan", h2))
     actions = []
     if state.portfolio and state.portfolio["underperformers"]:
         actions.append(f"Switch out of underperformers: {', '.join(state.portfolio['underperformers'])}.")
-    if state.proposed_portfolio:
-        actions.append(f"Start the new monthly SIP of {_inr(state.proposed_portfolio['monthly_sip'])} "
-                       f"across the recommended funds above.")
+    if state.proposed_portfolios:
+        total_sip = sum(pp["monthly_sip"] for pp in state.proposed_portfolios.values())
+        actions.append(f"Start the new monthly SIP of {_inr(total_sip)} across the per-goal "
+                       f"current-phase portfolios above. Each goal glides between phases as it approaches.")
     parked = [g.name for g in state.goals if not g.funded]
     if parked:
         actions.append(f"Revisit parked goal(s) — {', '.join(parked)} — when income grows.")

@@ -15,12 +15,14 @@ from loguru import logger
 load_dotenv(override=True)
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.frameworks.rtvi import RTVIObserver, RTVIProcessor
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.openai.llm import OpenAILLMService
@@ -29,7 +31,7 @@ from pipecat.transports.base_transport import TransportParams
 
 from agent.prompts import GREETING_INSTRUCTION, SYSTEM_PROMPT
 from agent.tools import register_tools
-from core import session
+from core import session, ui_bus
 
 PDF_PORT = 7861
 
@@ -37,14 +39,21 @@ transport_params = {
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(),
+        # Tuned for noisy demo environments: longer stop_secs avoids chopping
+        # utterances at natural pauses; higher confidence/volume ignores fans, typing.
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(
+            confidence=0.90,
+            start_secs=0.40,
+            stop_secs=0.80,
+            min_volume=0.75,
+        )),
     ),
 }
 
 
 def make_stt():
     """Pluggable STT behind STT_PROVIDER: ringg | sarvam | deepgram."""
-    provider = os.getenv("STT_PROVIDER", "sarvam").lower()
+    provider = os.getenv("STT_PROVIDER", "ringg").lower()
 
     if provider == "ringg":
         if os.getenv("RINGG_API_KEY"):
@@ -90,11 +99,15 @@ async def run_bot(transport):
     tts = SarvamTTSService(
         api_key=os.environ["SARVAM_API_KEY"],
         settings=SarvamTTSService.Settings(
-            model=os.getenv("SARVAM_TTS_MODEL", "bulbul:v2"),
+            model=os.getenv("SARVAM_TTS_MODEL", "bulbul:v3"),
             voice=os.getenv("SARVAM_VOICE_ID", "anushka"),
             language="en-IN",
         ),
     )
+
+    # RTVI: pushes live state snapshots to the browser UI over the data channel.
+    rtvi = RTVIProcessor(transport=transport)
+    ui_bus.bind(rtvi)
 
     context = LLMContext(
         messages=[
@@ -107,6 +120,7 @@ async def run_bot(transport):
 
     pipeline = Pipeline([
         transport.input(),
+        rtvi,
         stt,
         aggregators.user(),
         llm,
@@ -117,17 +131,20 @@ async def run_bot(transport):
 
     task = PipelineTask(
         pipeline,
-        params=PipelineParams(audio_in_sample_rate=16000),
+        params=PipelineParams(audio_in_sample_rate=16000, audio_out_sample_rate=24000),
+        observers=[RTVIObserver(rtvi)],
     )
 
-    @transport.event_handler("on_client_connected")
-    async def on_client_connected(transport, client):
-        logger.info("Client connected — Maya speaks first")
+    @rtvi.event_handler("on_client_ready")
+    async def on_client_ready(rtvi):
+        logger.info("Client ready — Maya speaks first")
+        await rtvi.set_bot_ready()
         await task.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info("Client disconnected")
+        ui_bus.unbind()
         await task.cancel()
 
     runner = PipelineRunner(handle_sigint=False)

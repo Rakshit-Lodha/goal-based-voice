@@ -28,17 +28,19 @@ def test_financial_ratios():
     r = fm.financial_ratios(100_000, 60_000, 10_000, existing_monthly_sip=12_000)
     assert r["surplus"] == 30_000
     assert r["savings_rate"] == pytest.approx(0.30)
-    assert r["savings_band"] == "moderate"
+    assert r["savings_band"] == "bad"
     assert r["debt_to_income"] == pytest.approx(0.10)
-    assert r["dti_band"] == "healthy"
+    assert r["dti_band"] == "average"
     assert r["idle_surplus"] == 18_000
 
 
 def test_financial_ratios_bands():
-    assert fm.financial_ratios(100_000, 95_000)["savings_band"] == "low"
-    assert fm.financial_ratios(100_000, 50_000)["savings_band"] == "strong"
-    assert fm.financial_ratios(100_000, 30_000, 45_000)["dti_band"] == "stretched"
-    assert fm.financial_ratios(100_000, 30_000, 25_000)["dti_band"] == "moderate"
+    assert fm.financial_ratios(100_000, 65_000)["savings_band"] == "bad"
+    assert fm.financial_ratios(100_000, 50_000)["savings_band"] == "average"
+    assert fm.financial_ratios(100_000, 30_000)["savings_band"] == "good"
+    assert fm.financial_ratios(100_000, 30_000, 25_000)["dti_band"] == "bad"
+    assert fm.financial_ratios(100_000, 30_000, 10_000)["dti_band"] == "average"
+    assert fm.financial_ratios(100_000, 30_000, 9_000)["dti_band"] == "good"
 
 
 def test_lumpsum_fv():
@@ -95,6 +97,47 @@ def test_risk_profile_mapping():
     assert cons["risk_profile"] == "conservative"
     assert cons["equity_band"] == 0.30
 
-    bal = fm.risk_profile_from_answers(["hold", "buy a bit more"])
+    # Mixed signals (one aggressive + one conservative) cancel → balanced.
+    bal = fm.risk_profile_from_answers(["top up", "protect capital"])
     assert bal["risk_profile"] == "balanced"
     assert bal["expected_return"] == 0.11
+
+    # Single tilt is enough under the 2-question threshold (±1).
+    tilt = fm.risk_profile_from_answers(["hold steady", "maximize returns"])
+    assert tilt["risk_profile"] == "aggressive"
+
+
+def test_horizon_bucket():
+    assert fm.horizon_bucket(1) == "short"
+    assert fm.horizon_bucket(3) == "short"
+    assert fm.horizon_bucket(4) == "medium"
+    assert fm.horizon_bucket(7) == "medium"
+    assert fm.horizon_bucket(8) == "long"
+    assert fm.horizon_bucket(25) == "long"
+
+
+def test_build_phases_short():
+    phases = fm.build_phases("short", 3, 10_000)
+    assert len(phases) == 1
+    assert phases[0]["duration_years"] == 3
+    assert phases[0]["allocation"]["debt"] == 0.95
+    # Equity allocation is 0 → no equity funds in this phase
+    assert all(f["bucket"] != "equity" for f in phases[0]["funds"])
+
+
+def test_build_phases_medium_durations_sum_to_horizon():
+    for years in (4, 5, 6, 7):
+        phases = fm.build_phases("medium", years, 20_000)
+        assert len(phases) == 2
+        assert sum(p["duration_years"] for p in phases) == years
+
+
+def test_build_phases_long_glides_equity_down():
+    phases = fm.build_phases("long", 25, 30_000)
+    assert len(phases) == 3
+    assert sum(p["duration_years"] for p in phases) == 25
+    # Equity share should decrease monotonically across phases (glide-down)
+    eq = [p["allocation"]["equity"] for p in phases]
+    assert eq[0] > eq[1] > eq[2]
+    # All phases have at least one fund
+    assert all(p["funds"] for p in phases)
